@@ -100,3 +100,7 @@ Tiled kernels on RDNA2 stall near 50% of peak because they run out of LDS bandwi
 - Waves in a block warm the scalar cache together, so misses overlap instead of stalling one at a time.
 
 The int8 and int4 matmuls use `v_dot4c_i32_i8` and `v_dot8_i32_i4` this way, reaching about 65 and 100-120 TOPS. ConvRot, quantization and `situ` are fused into one pass over the activations.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

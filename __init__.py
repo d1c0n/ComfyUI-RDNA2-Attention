@@ -81,7 +81,7 @@ class RDNA2TextGenerate(io.ComfyNode):
             node_id="RDNA2TextGenerate",
             display_name="RDNA2 Text Generate",
             category="model/patch",
-            description="Much faster Generate Text with int8 text encoders on RX 6900 XT class GPUs (gfx1030). Only single token steps change, so prompt encoding is unaffected.",
+            description="Much faster Generate Text with int8 text encoders on RX 6900 XT class GPUs (gfx1030). Only Generate Text changes, prompt encoding is unaffected.",
             inputs=[io.Clip.Input("clip")],
             outputs=[io.Clip.Output()],
         )

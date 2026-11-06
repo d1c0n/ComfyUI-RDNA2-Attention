@@ -57,7 +57,7 @@ Add **RDNA2 Text Generate** after the CLIP loader and connect it to both Generat
 CLIP loader -> RDNA2 Text Generate -> Generate Text, CLIP Text Encode
 ```
 
-ComfyUI otherwise dequantizes every int8 weight on every generated token on this card. The node reads the weights directly on single token steps, about 10x faster per token with the same output. Prompt encoding does not change. It needs an int8 text encoder for the linear layers. Layers with LoRA patches fall back.
+ComfyUI otherwise dequantizes every int8 weight on every generated token on this card. The node reads the weights directly on single token steps and adds the fp32 decode attention that lets ComfyUI replay each layer from a graph, about 20x faster per token with the same output. Graphs need dynamic VRAM, without them it is about 8x. Prompt encoding does not change. It needs an int8 text encoder for the linear layers. Layers with LoRA patches fall back.
 
 ## Recommended setup per model
 

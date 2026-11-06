@@ -1,17 +1,21 @@
 import ctypes
 import functools
 
+import comfy_kitchen
 import torch
 
 import comfy.ops
 from comfy.ops import MixedPrecisionOp
-from comfy.text_encoders.llama import BaseQwen3
+from comfy.text_encoders.llama import BaseQwen3, FixedKV
 
 from .hip_attention import Kernels, launch
 
 BLOCK_ROWS = 16  # WAVES * ROWS in int8_gemv.hip
 STEP = 512  # STEP in int8_gemv.hip
 BF16_STEP = 256  # BF16_STEP in int8_gemv.hip
+SPLITS = 32  # SPLITS in int8_gemv.hip
+GROUPS = 4  # GROUPS in int8_gemv.hip
+HEAD = 128  # HEAD in int8_gemv.hip
 
 kernels = None
 
@@ -19,7 +23,7 @@ kernels = None
 def get_kernels():
     global kernels
     if kernels is None:
-        kernels = Kernels("int8_gemv", ("rotate", "gemv_i8", "gemv_bf16"))
+        kernels = Kernels("int8_gemv", ("rotate", "gemv_i8", "gemv_bf16", "attn_decode", "attn_merge"))
     return kernels
 
 
@@ -57,6 +61,34 @@ def logits(transformer, x):
     return out
 
 
+def attention_decode(q, k, v, lengths):
+    """q is (batch, 1, heads, 128), k and v are (batch, capacity, kv heads, 128) and lengths (batch,) int32, all but lengths fp32."""
+    batch, _, heads, _ = q.shape
+    _, capacity, kv_heads, _ = k.shape
+    kernels = get_kernels()
+    c_int, c_ptr = ctypes.c_int, ctypes.c_void_p
+    q = q.contiguous()
+    out = torch.empty_like(q)
+    partial = torch.empty((batch * heads, SPLITS, HEAD), dtype=torch.float32, device=q.device)
+    stats = torch.empty((batch * heads, SPLITS, 2), dtype=torch.float32, device=q.device)
+    launch(kernels.attn_decode, SPLITS, batch * kv_heads, 256, [c_ptr(q.data_ptr()), c_ptr(k.data_ptr()), c_ptr(v.data_ptr()), c_ptr(lengths.data_ptr()),
+                                                                c_ptr(partial.data_ptr()), c_ptr(stats.data_ptr()), c_int(capacity), c_int(kv_heads), ctypes.c_float(HEAD ** -0.5)])
+    launch(kernels.attn_merge, batch * heads, 1, HEAD, [c_ptr(partial.data_ptr()), c_ptr(stats.data_ptr()), c_ptr(out.data_ptr())])
+    return out
+
+
+def init_kv_cache(model, batch, capacity, device, dtype):
+    # A FixedKV cache is what lets core replay each layer from a graph. Kitchen only offers it with bf16, which this card doesn't have.
+    config = model.config
+    position = torch.empty((batch,), device=device, dtype=torch.int64)
+    length = torch.zeros((batch,), device=device, dtype=torch.int32)
+    caches = []
+    for _ in range(config.num_hidden_layers):
+        key = torch.empty((batch, capacity, config.num_key_value_heads, HEAD), device=device, dtype=dtype)
+        caches.append(FixedKV(key, torch.empty_like(key), 0, position, length))
+    return caches
+
+
 def patch(clip):
     """Single token steps of text generation read int8 and bf16 weights directly instead of dequantizing them on every token."""
     for name, module in clip.patcher.model.named_modules():
@@ -70,3 +102,7 @@ def patch(clip):
             embed = module.model.embed_tokens
             if embed.weight.dtype == torch.bfloat16 and embed.weight.shape[0] % BLOCK_ROWS == 0 and embed.weight.shape[1] % BF16_STEP == 0:
                 clip.patcher.add_object_patch(f"{name}.logits", functools.partial(logits, module))
+            config = module.model.config
+            if module.model.fixed_kv and config.head_dim == HEAD and config.num_attention_heads == config.num_key_value_heads * GROUPS:
+                comfy_kitchen.flash_attention_decode = attention_decode
+                clip.patcher.add_object_patch(f"{name}.model.init_kv_cache", functools.partial(init_kv_cache, module.model))

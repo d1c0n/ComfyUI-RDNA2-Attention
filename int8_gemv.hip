@@ -8,6 +8,9 @@
 #define ROWS 2
 #define STEP 512  // int8 values a wave reads from one row per step, 16 per lane.
 #define BF16_STEP 256  // bf16 values, 8 per lane.
+#define SPLITS 32  // Blocks per KV head in attn_decode.
+#define GROUPS 4  // Query heads per KV head.
+#define HEAD 128
 
 typedef unsigned int u32;
 typedef u32 u32x4 __attribute__((ext_vector_type(4)));
@@ -113,4 +116,80 @@ extern "C" __global__ __launch_bounds__(256) void gemv_bf16(const float* x, cons
         float sum = wave_sum(acc[r]);
         if (lane == 0) out[row + r] = sum;
     }
+}
+
+// Attention for one new token over the fixed KV cache, split by position so that a few KV heads still fill the GPU.
+// The grid is fixed and the length read here, so this can be replayed from a graph as the cache grows.
+// One wave takes one position at a time: a K or V row of a head is 512 bytes, 16 per lane, shared by GROUPS query heads.
+extern "C" __global__ __launch_bounds__(256) void attn_decode(const float* q, const float* k, const float* v, const int* lengths, float* partial, float* stats, int capacity, int kv_heads, float scale) {
+    __shared__ float acc_s[WAVES][GROUPS][HEAD];
+    __shared__ float max_s[WAVES][GROUPS], sum_s[WAVES][GROUPS];
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int b = blockIdx.y / kv_heads, kv_head = blockIdx.y % kv_heads, split = blockIdx.x;
+    const int length = lengths[b];
+    const int chunk = (length + SPLITS - 1) / SPLITS;
+    const int end = min((split + 1) * chunk, length);
+    const int first_head = b * kv_heads * GROUPS + kv_head * GROUPS;
+
+    f32x4 qv[GROUPS], acc[GROUPS];
+    float mx[GROUPS], sum[GROUPS];
+    #pragma unroll
+    for (int g = 0; g < GROUPS; g++) {
+        qv[g] = ((const f32x4*)(q + (size_t)(first_head + g) * HEAD))[lane] * scale;
+        acc[g] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
+        mx[g] = -1e30f;
+        sum[g] = 0.0f;
+    }
+    for (int j = split * chunk + wave; j < end; j += WAVES) {
+        const size_t row = ((size_t)(b * capacity + j) * kv_heads + kv_head) * HEAD;
+        f32x4 kv = ((const f32x4*)(k + row))[lane], vv = ((const f32x4*)(v + row))[lane];
+        #pragma unroll
+        for (int g = 0; g < GROUPS; g++) {
+            f32x4 d = qv[g] * kv;
+            float score = wave_sum(d[0] + d[1] + d[2] + d[3]);
+            float next = fmaxf(mx[g], score);
+            float keep = expf(mx[g] - next), p = expf(score - next);
+            sum[g] = sum[g] * keep + p;
+            acc[g] = acc[g] * keep + vv * p;
+            mx[g] = next;
+        }
+    }
+    #pragma unroll
+    for (int g = 0; g < GROUPS; g++) {
+        ((f32x4*)acc_s[wave][g])[lane] = acc[g];
+        if (lane == 0) { max_s[wave][g] = mx[g]; sum_s[wave][g] = sum[g]; }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < GROUPS * HEAD; i += 256) {
+        const int g = i / HEAD, d = i % HEAD;
+        float top = max_s[0][g];
+        #pragma unroll
+        for (int w = 1; w < WAVES; w++) top = fmaxf(top, max_s[w][g]);
+        float value = 0.0f, total = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < WAVES; w++) {
+            float keep = expf(max_s[w][g] - top);
+            value += acc_s[w][g][d] * keep;
+            total += sum_s[w][g] * keep;
+        }
+        const size_t at = (size_t)(first_head + g) * SPLITS + split;
+        partial[at * HEAD + d] = value;
+        if (d == 0) { stats[at * 2] = top; stats[at * 2 + 1] = total; }
+    }
+}
+
+// Joins the splits of attn_decode. One block per query head, one thread per value.
+extern "C" __global__ __launch_bounds__(HEAD) void attn_merge(const float* partial, const float* stats, float* out) {
+    const size_t head = blockIdx.x;
+    const float* st = stats + head * SPLITS * 2;
+    float top = st[0];
+    for (int s = 1; s < SPLITS; s++) top = fmaxf(top, st[s * 2]);
+    float value = 0.0f, total = 0.0f;
+    for (int s = 0; s < SPLITS; s++) {
+        float keep = expf(st[s * 2] - top);
+        value += partial[(head * SPLITS + s) * HEAD + threadIdx.x] * keep;
+        total += st[s * 2 + 1] * keep;
+    }
+    out[head * HEAD + threadIdx.x] = value / total;
 }

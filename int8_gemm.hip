@@ -7,16 +7,21 @@ typedef unsigned u32;
 typedef u32 u4 __attribute__((ext_vector_type(4)));
 typedef u32 s16 __attribute__((ext_vector_type(16)));
 typedef _Float16 h8 __attribute__((ext_vector_type(8)));
+typedef u32 s8 __attribute__((ext_vector_type(8)));
 typedef const __attribute__((address_space(4))) s16* cs16;
+typedef const __attribute__((address_space(4))) s8* cs8;
 typedef const __attribute__((address_space(4))) u32* cu32;
 typedef const __attribute__((address_space(4))) char* cchar;
 #define WAVES 8
 #define ROT_WAVES 4
 #define ROT_THREADS (ROT_WAVES * 32)
 #define WARM_AT 8
+#define WARM_AT_RAW 24
 #define WARM_LINES (64 / WAVES)
 #define FENCE __builtin_amdgcn_sched_barrier(0)
-enum Act { NO_ACT, SITU, SWIGLU };
+enum Act { NO_ACT, SITU, SWIGLU, GATE, MOD };
+// The RMS norm and modulation in front of a Krea 2 block's linears. s is 1 + scale, s and t hold one row per batch.
+struct Mod { const float* w; const _Float16* s; const _Float16* t; int L; float eps; };
 template <bool I4> __device__ __forceinline__ int dot(u32 a, u32 b, int c) {
     return I4 ? __builtin_amdgcn_sdot8((int)a, (int)b, c, false) : __builtin_amdgcn_sdot4((int)a, (int)b, c, false);
 }
@@ -126,6 +131,17 @@ __device__ __forceinline__ float swiglu(float gate, float up) {
     return (float)(_Float16)((float)(_Float16)(gate / (1.f + expf(-gate))) * up);
 }
 
+// Rounds to fp16 at the same points as x * F.sigmoid(gate).
+__device__ __forceinline__ float sigmoid_gate(float x, float gate) {
+    return (float)(_Float16)(x * (float)(_Float16)(1.f / (1.f + expf(-gate))));
+}
+
+// Rounds to fp16 at the same points as s * rms_norm(x) + t.
+__device__ __forceinline__ float modulate(float x, float rstd, float w, float s, float t) {
+#pragma clang fp contract(off)
+    return (float)(_Float16)((float)(_Float16)((float)(_Float16)(x * rstd * (w + 1.f)) * s) + t);
+}
+
 __device__ __forceinline__ void wave_sync() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
@@ -136,29 +152,69 @@ __device__ __forceinline__ void wave_sync() {
 // SITU reads a 2K wide [hidden | gate] row and SWIGLU a gate row from X and an up row from U. Both apply the activation first, so the K wide
 // activation never goes through VRAM.
 template <Act ACT, bool I4>
-__device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, const _Float16* __restrict__ U, u4* __restrict__ Ap, float* __restrict__ as, int K) {
-    __shared__ float red[ROT_WAVES];
+__device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, const _Float16* __restrict__ U, u4* __restrict__ Ap, float* __restrict__ as, int K, Mod mod = {}) {
+    __shared__ float red[ROT_WAVES * 2];
     __shared__ float swap[ROT_WAVES][2][16 * 17];
     // Sized to K at launch. A fixed maximum would leave room for far fewer blocks per WGP.
     extern __shared__ __attribute__((aligned(16))) _Float16 rotated[];
     const int wave = threadIdx.x >> 5, half = (threadIdx.x >> 4) & 1, c = threadIdx.x & 15, groups = K / 256;
     const h8* x = (const h8*)(X + (size_t)blockIdx.x * K * (ACT == SITU ? 2 : 1));
     const h8* u = (const h8*)(U + (size_t)blockIdx.x * K);
+    const h8* ms = (const h8*)(mod.s + (size_t)(blockIdx.x / (mod.L ? mod.L : 1)) * K);
+    const h8* mt = (const h8*)(mod.t + (size_t)(blockIdx.x / (mod.L ? mod.L : 1)) * K);
     float* sw = swap[wave][half];
+    float rstd = 0.f;
+    if (ACT == MOD) {
+        // The sums run in the order of rms_norm_row, whose 256 threads this block covers two at a time.
+        float sum[2] = {0.f, 0.f};
+#pragma unroll
+        for (int v = 0; v < 2; v++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int idx = threadIdx.x + v * ROT_THREADS + i * 256;
+                if (idx < K / 8) {
+                    h8 row = x[idx];
+                    ((h8*)rotated)[idx] = row;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) sum[v] += (float)row[j] * (float)row[j];
+                }
+            }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) { sum[0] += __shfl_xor(sum[0], o, 32); sum[1] += __shfl_xor(sum[1], o, 32); }
+        if ((threadIdx.x & 31) == 0) { red[wave] = sum[0]; red[wave + ROT_WAVES] = sum[1]; }
+        __syncthreads();
+        float total = 0.f;
+#pragma unroll
+        for (int i = 0; i < ROT_WAVES * 2; i++) total += red[i];
+        rstd = rsqrtf(total / K + mod.eps);
+        __syncthreads();
+    }
     float mx = 0.f;
     for (int g = wave * 2 + half; g < (groups + 1) / 2 * 2; g += ROT_WAVES * 2) {
         const bool active = g < groups;
         float v[16];
         if (active) {
-            h8 lo = x[g * 32 + c * 2], hi = x[g * 32 + c * 2 + 1];
+            const h8* src = ACT == MOD ? (const h8*)rotated : x;
+            h8 lo = src[g * 32 + c * 2], hi = src[g * 32 + c * 2 + 1];
             if (ACT == SITU) {
                 h8 glo = x[K / 8 + g * 32 + c * 2], ghi = x[K / 8 + g * 32 + c * 2 + 1];
 #pragma unroll
                 for (int i = 0; i < 8; i++) { v[i] = situ((float)lo[i], (float)glo[i]); v[8 + i] = situ((float)hi[i], (float)ghi[i]); }
-            } else if (ACT == SWIGLU) {
+            } else if (ACT == SWIGLU || ACT == GATE) {
                 h8 ulo = u[g * 32 + c * 2], uhi = u[g * 32 + c * 2 + 1];
 #pragma unroll
-                for (int i = 0; i < 8; i++) { v[i] = swiglu((float)lo[i], (float)ulo[i]); v[8 + i] = swiglu((float)hi[i], (float)uhi[i]); }
+                for (int i = 0; i < 8; i++) {
+                    v[i] = ACT == SWIGLU ? swiglu((float)lo[i], (float)ulo[i]) : sigmoid_gate((float)lo[i], (float)ulo[i]);
+                    v[8 + i] = ACT == SWIGLU ? swiglu((float)hi[i], (float)uhi[i]) : sigmoid_gate((float)hi[i], (float)uhi[i]);
+                }
+            } else if (ACT == MOD) {
+                h8 slo = ms[g * 32 + c * 2], shi = ms[g * 32 + c * 2 + 1], tlo = mt[g * 32 + c * 2], thi = mt[g * 32 + c * 2 + 1];
+                const float* w = mod.w + g * 256 + c * 16;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    v[i] = modulate((float)lo[i], rstd, w[i], (float)slo[i], (float)tlo[i]);
+                    v[8 + i] = modulate((float)hi[i], rstd, w[8 + i], (float)shi[i], (float)thi[i]);
+                }
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; i++) { v[i] = (float)lo[i]; v[8 + i] = (float)hi[i]; }
@@ -198,6 +254,15 @@ extern "C" __global__ __launch_bounds__(ROT_THREADS) void swiglu_rot_quant_pack_
     rot_quant<SWIGLU, false>(X, U, Ap, as, K);
 }
 
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void gate_rot_quant_pack_a(const _Float16* __restrict__ X, const _Float16* __restrict__ U, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+    rot_quant<GATE, false>(X, U, Ap, as, K);
+}
+
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void mod_rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K,
+    const float* __restrict__ W, const _Float16* __restrict__ S, const _Float16* __restrict__ T, int L, float eps) {
+    rot_quant<MOD, false>(X, nullptr, Ap, as, K, Mod{W, S, T, L, eps});
+}
+
 extern "C" __global__ __launch_bounds__(ROT_THREADS) void rot_quant_pack_a_i4(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     rot_quant<NO_ACT, true>(X, nullptr, Ap, as, K);
 }
@@ -211,7 +276,17 @@ extern "C" __global__ __launch_bounds__(256) void pack_b(const u32* __restrict__
 }
 
 struct Chunk { s16 a, b; };
-__device__ __forceinline__ void ld(Chunk& c, cchar p, int n) { c.a = *(cs16)(p + n * 128); c.b = *(cs16)(p + n * 128 + 64); }
+// A row pitch of RB reads a raw (N, K) weight in place. RB of 0 reads the pack_b stream.
+template <int RB> __device__ __forceinline__ void ld(Chunk& c, cchar p, int n) {
+    if (RB) {
+        const int col = (n >> 1) * 4, h = (n & 1) * 32;
+        s8 w0 = *(cs8)(p + col * RB + h), w1 = *(cs8)(p + (col + 1) * RB + h), w2 = *(cs8)(p + (col + 2) * RB + h), w3 = *(cs8)(p + (col + 3) * RB + h);
+        c.a = __builtin_shufflevector(w0, w1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        c.b = __builtin_shufflevector(w2, w3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    } else {
+        c.a = *(cs16)(p + n * 128); c.b = *(cs16)(p + n * 128 + 64);
+    }
+}
 // chunk n: column group n >> 1 (4 columns), dword half n & 1 (8 dwords of the 16 in this k step)
 template <bool I4>
 __device__ __forceinline__ void mac(const Chunk& c, const u32 (&a)[2][16], int (&acc)[2][64], int n) {
@@ -227,53 +302,65 @@ __device__ __forceinline__ void mac(const Chunk& c, const u32 (&a)[2][16], int (
         }
     }
 }
+// Activations are read once per column tile, so they shouldn't push weights, which every row block shares, out of the cache.
 __device__ __forceinline__ void load_a(u32 (&a)[2][16], const u4* ap, int kc) {
 #pragma unroll
     for (int r = 0; r < 2; r++)
 #pragma unroll
         for (int q = 0; q < 4; q++) {
-            u4 v = ap[((kc * 2 + r) * 4 + q) * 32];
+            u4 v = __builtin_nontemporal_load(&ap[((kc * 2 + r) * 4 + q) * 32]);
             a[r][q * 4] = v.x; a[r][q * 4 + 1] = v.y; a[r][q * 4 + 2] = v.z; a[r][q * 4 + 3] = v.w;
         }
 }
-template <bool I4>
+template <bool I4, int RB>
 __device__ __forceinline__ void gemm_body(const u4* __restrict__ Ap, const u32* Bp, const float* __restrict__ as, const float* __restrict__ ws, const _Float16* __restrict__ bias, _Float16* __restrict__ C,
-    int M, int N, int KCs)
+    int M, int N, int KCs, const _Float16* __restrict__ R, const _Float16* __restrict__ G, int L)
 {
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5), lane = threadIdx.x & 31;
     const int wt = blockIdx.x * WAVES + wave, nt = blockIdx.y;
+    // Rows past M only exist to fill the last block. Leaving frees their dot slots for the waves that have work.
+    if (wt * 64 >= M) return;
     const u4* ap = Ap + (size_t)wt * KCs * 256 + lane;
-    cchar p = (cchar)(Bp + (size_t)nt * KCs * 1024);
+    // Integer sums are exact in any order, so column tiles start at different k to spread reads over the memory channels.
+    const int step = RB ? 64 : 4096;
+    cchar base = (cchar)Bp + (size_t)nt * (RB ? 64 * RB : KCs * 4096);
+    int kc = nt % KCs;
+    cchar p = base + kc * step;
     int acc[2][64];
 #pragma unroll
     for (int r = 0; r < 2; r++)
 #pragma unroll
         for (int i = 0; i < 64; i++) acc[r][i] = 0;
     u32 a[2][16], an[2][16];
-    load_a(a, ap, 0);
+    load_a(a, ap, kc);
     Chunk X, Y;
-    ld(X, p, 0);
-    for (int kc = 0; kc < KCs; kc++) {
+    ld<RB>(X, p, 0);
+    for (int i = 0; i < KCs; i++) {
+        const int next = kc + 1 == KCs ? 0 : kc + 1;
+        cchar pn = base + next * step;
         FENCE; __builtin_amdgcn_s_barrier(); FENCE;
-        if (kc + 1 < KCs) load_a(an, ap, kc + 1);
+        load_a(an, ap, next);
         FENCE;
 #pragma unroll
         for (int n = 0; n < 32; n += 2) {
             u32 w[WARM_LINES];
-            if (n == WARM_AT) {
+            if (n == (RB ? WARM_AT_RAW : WARM_AT)) {
 #pragma unroll
-                for (int i = 0; i < WARM_LINES; i++) w[i] = *(cu32)(p + 4096 + (wave * WARM_LINES + i) * 64);
+                for (int i = 0; i < WARM_LINES; i++) w[i] = *(cu32)(pn + (wave * WARM_LINES + i) * (RB ? RB : 64));
             }
-            ld(Y, p, n + 1); FENCE;
+            ld<RB>(Y, p, n + 1); FENCE;
             mac<I4>(X, a, acc, n); FENCE;
-            if (n == WARM_AT) {
+            if (n == (RB ? WARM_AT_RAW : WARM_AT)) {
 #pragma unroll
                 for (int i = 0; i < WARM_LINES; i++) asm volatile("" :: "s"(w[i]));
             }
-            ld(X, p, n + 2); FENCE;
+            if (n == 30) ld<RB>(X, pn, 0);
+            else ld<RB>(X, p, n + 2);
+            FENCE;
             mac<I4>(Y, a, acc, n + 1); FENCE;
         }
-        p += 4096;
+        p = pn;
+        kc = next;
 #pragma unroll
         for (int r = 0; r < 2; r++)
 #pragma unroll
@@ -301,13 +388,27 @@ __device__ __forceinline__ void gemm_body(const u4* __restrict__ Ap, const u32* 
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int local = i * 4 + (lane >> 3), col = lane & 7;
-            if (base + local < M) *(h8*)(C + (size_t)(base + local) * N + nt * 64 + col * 8) = tile[wave][local][col];
+            if (base + local < M) {
+                const size_t at = (size_t)(base + local) * N + nt * 64 + col * 8;
+                h8 y = tile[wave][local][col];
+                if (R) {
+#pragma clang fp contract(off)
+                    // A block's residual, R + G * y, with the rounding of the separate ops.
+                    const h8 res = *(const h8*)(R + at), gate = *(const h8*)(G + (size_t)((base + local) / L) * N + nt * 64 + col * 8);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) y[j] = (_Float16)((float)res[j] + (float)(_Float16)((float)gate[j] * (float)y[j]));
+                }
+                *(h8*)(C + at) = y;
+            }
         }
         wave_sync();
     }
 }
 
 // KCs counts 64 byte steps of a row, so an int4 row of K values is simply a row of K / 2 bytes here.
-#define GEMM_ARGS const u4* __restrict__ Ap, const u32* Bp, const float* __restrict__ as, const float* __restrict__ ws, const _Float16* __restrict__ bias, _Float16* __restrict__ C, int M, int N, int KCs
-extern "C" __global__ __launch_bounds__(WAVES * 32) void gemm(GEMM_ARGS) { gemm_body<false>(Ap, Bp, as, ws, bias, C, M, N, KCs); }
-extern "C" __global__ __launch_bounds__(WAVES * 32) void gemm_i4(GEMM_ARGS) { gemm_body<true>(Ap, Bp, as, ws, bias, C, M, N, KCs); }
+#define GEMM_ARGS const u4* __restrict__ Ap, const u32* Bp, const float* __restrict__ as, const float* __restrict__ ws, const _Float16* __restrict__ bias, _Float16* __restrict__ C, int M, int N, int KCs, \
+    const _Float16* __restrict__ R, const _Float16* __restrict__ G, int L
+extern "C" __global__ __launch_bounds__(WAVES * 32) void gemm(GEMM_ARGS) { gemm_body<false, 0>(Ap, Bp, as, ws, bias, C, M, N, KCs, R, G, L); }
+extern "C" __global__ __launch_bounds__(WAVES * 32) void gemm_i4(GEMM_ARGS) { gemm_body<true, 0>(Ap, Bp, as, ws, bias, C, M, N, KCs, R, G, L); }
+// pack_b is not needed where the row pitch spreads over the memory channels. A power of two pitch does not, so K = 16384 stays on the stream.
+extern "C" __global__ __launch_bounds__(WAVES * 32) void gemm_k6144(GEMM_ARGS) { gemm_body<false, 6144>(Ap, Bp, as, ws, bias, C, M, N, KCs, R, G, L); }

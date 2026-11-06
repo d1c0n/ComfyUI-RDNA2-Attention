@@ -159,10 +159,12 @@ __device__ __forceinline__ void qk_i8(const Chunk& c, const u32* q, int* s, int 
 
 // attn with int8 QK^T. PV stays fp16: quantizing P destroys the small probabilities that make up most of the output.
 extern "C" __global__ __launch_bounds__(WAVES * 32) void attn_i8(const _Float16* __restrict__ Q, const u32* P, _Float16* __restrict__ O,
-    int Lq, int Lk, int groups, int H, int sqb, int sqh, int sql, int sob, int soh, int sol, float scale_log2)
+    int Lq, int Lk, int groups, int H, int rep, int sqb, int sqh, int sql, int sob, int soh, int sol, float scale_log2)
 {
     const int bh = blockIdx.y, b = bh / H, h = bh % H;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    // Waves that only hold padding rows leave, which frees their dot slots.
+    if ((int)(blockIdx.x * WAVES + wave) * 32 >= Lq) return;
     const int row = (blockIdx.x * WAVES + wave) * 32 + (threadIdx.x & 31);
     const int q_row = row < Lq ? row : Lq - 1;
 
@@ -196,7 +198,7 @@ extern "C" __global__ __launch_bounds__(WAVES * 32) void attn_i8(const _Float16*
     for (int i = 0; i < 128; i++) o[i] = 0.f;
     float m = -1e30f, l = 0.f;
 
-    cchar p = (cchar)(P + (size_t)bh * (groups + 1) * I8_GROUP);
+    cchar p = (cchar)(P + (size_t)(bh / rep) * (groups + 1) * I8_GROUP);
     Chunk A, B;
     load_chunk_i8(A, p, 0);
     for (int g = 0; g < groups; g++) {
@@ -276,10 +278,12 @@ extern "C" __global__ __launch_bounds__(WAVES * 32) void attn_i8(const _Float16*
 }
 
 extern "C" __global__ __launch_bounds__(WAVES * 32) void attn(const _Float16* __restrict__ Q, const u32* P, _Float16* __restrict__ O,
-    int Lq, int Lk, int groups, int H, int sqb, int sqh, int sql, int sob, int soh, int sol, float scale_log2)
+    int Lq, int Lk, int groups, int H, int rep, int sqb, int sqh, int sql, int sob, int soh, int sol, float scale_log2)
 {
     const int bh = blockIdx.y, b = bh / H, h = bh % H;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    // Waves that only hold padding rows leave, which frees their dot slots.
+    if ((int)(blockIdx.x * WAVES + wave) * 32 >= Lq) return;
     const int row = (blockIdx.x * WAVES + wave) * 32 + (threadIdx.x & 31);
     const int q_row = row < Lq ? row : Lq - 1;
 
@@ -295,7 +299,7 @@ extern "C" __global__ __launch_bounds__(WAVES * 32) void attn(const _Float16* __
     for (int i = 0; i < 128; i++) o[i] = 0.f;
     float m = -1e30f, l = 0.f;
 
-    cchar p = (cchar)(P + (size_t)bh * (groups + 1) * 2048);
+    cchar p = (cchar)(P + (size_t)(bh / rep) * (groups + 1) * 2048);
     // Scalar loads return out of order, so only one chunk may be in flight while the other is used.
     Chunk A, B;
     load_chunk(A, p, 0);

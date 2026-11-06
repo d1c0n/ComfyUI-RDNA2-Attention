@@ -46,21 +46,21 @@ kernels = None
 
 
 def attention(q, k, v, out, scale, int8_qk=False):
-    """q, k, v, out are (batch, heads, length, 128) fp16 tensors with a contiguous last dimension."""
+    """q, k, v, out are (batch, heads, length, 128) fp16 tensors with a contiguous last dimension. k and v may have fewer heads than q, which then share them."""
     global kernels
     if kernels is None:
         kernels = Kernels("hip_attention", ("pack_kv", "attn", "pack_kv_i8", "attn_i8"))
 
     b, heads, q_len, _ = q.shape
-    k_len = k.shape[2]
+    _, kv_heads, k_len, _ = k.shape
     groups = (k_len + 15) // 16
     # The extra group is what the last iteration of attn prefetches.
-    packed = torch.empty(b * heads * (groups + 1) * (1552 if int8_qk else 2048), dtype=torch.int32, device=q.device)
+    packed = torch.empty(b * kv_heads * (groups + 1) * (1552 if int8_qk else 2048), dtype=torch.int32, device=q.device)
 
     c_int, c_ptr = ctypes.c_int, ctypes.c_void_p
-    launch(kernels.pack_kv_i8 if int8_qk else kernels.pack_kv, groups, b * heads, 256, [
-        c_ptr(k.data_ptr()), c_ptr(v.data_ptr()), c_ptr(packed.data_ptr()), c_int(k_len), c_int(groups), c_int(heads),
+    launch(kernels.pack_kv_i8 if int8_qk else kernels.pack_kv, groups, b * kv_heads, 256, [
+        c_ptr(k.data_ptr()), c_ptr(v.data_ptr()), c_ptr(packed.data_ptr()), c_int(k_len), c_int(groups), c_int(kv_heads),
         *[c_int(s) for s in k.stride()[:3]], *[c_int(s) for s in v.stride()[:3]]])
     launch(kernels.attn_i8 if int8_qk else kernels.attn, (q_len + BLOCK_ROWS - 1) // BLOCK_ROWS, b * heads, BLOCK_ROWS, [
-        c_ptr(q.data_ptr()), c_ptr(packed.data_ptr()), c_ptr(out.data_ptr()), c_int(q_len), c_int(k_len), c_int(groups), c_int(heads),
+        c_ptr(q.data_ptr()), c_ptr(packed.data_ptr()), c_ptr(out.data_ptr()), c_int(q_len), c_int(k_len), c_int(groups), c_int(heads), c_int(heads // kv_heads),
         *[c_int(s) for s in q.stride()[:3]], *[c_int(s) for s in out.stride()[:3]], ctypes.c_float(scale * math.log2(math.e))])

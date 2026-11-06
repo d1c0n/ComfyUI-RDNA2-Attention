@@ -49,7 +49,7 @@ class RDNA2Attention(io.ComfyNode):
                 io.Boolean.Input("fused_norm", default=False,
                                  tooltip="Krea 2 only: run RMSNorm as one fp16 kernel instead of casting to fp32 and back. About 1 value in 12000 changes by one fp16 step, which can still change the image."),
                 io.Boolean.Input("fused_swiglu", default=False,
-                                 tooltip="Krea 2 Int8 only, needs int8_gemm: fold the SwiGLU activation into the quantization of the down layer. Other layers run as before."),
+                                 tooltip="Krea 2 Int8 only, needs int8_gemm: fold the SwiGLU activation into the quantization of the down layer. With fused_norm and a hip backend, everything between a block's matmuls is fused too."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -63,6 +63,8 @@ class RDNA2Attention(io.ComfyNode):
             rms_norm.patch(m)
         if fused_swiglu:
             int8_kernels.patch_swiglu(m)
+        if fused_norm and fused_swiglu and backend != "bmm":
+            int8_kernels.patch_block(m, backend == "hip_int8")
         if transpose_weights:
             # Dynamic VRAM rebuilds weights from flat contiguous buffers, so it can't keep this layout.
             if m.is_dynamic():

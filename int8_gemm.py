@@ -1,10 +1,13 @@
 import ctypes
+import functools
 import logging
 import sys
 
 import torch
+import torch.nn.functional as F
 
 import comfy.ops
+from comfy.ldm.krea2.model import SwiGLU
 
 from .hip_attention import Kernels, launch
 
@@ -14,7 +17,7 @@ MIN_ROWS = 512  # Below this the weight packing costs more than the kernel saves
 MAX_ROT_K = 16384  # Keeps the rotated row within the LDS of a block.
 ROT_GROUP = 256
 
-KERNELS = ("quant_pack_a", "rot_quant_pack_a", "situ_rot_quant_pack_a", "rot_quant_pack_a_i4", "pack_b", "gemm", "gemm_i4")
+KERNELS = ("quant_pack_a", "rot_quant_pack_a", "situ_rot_quant_pack_a", "swiglu_rot_quant_pack_a", "rot_quant_pack_a_i4", "pack_b", "gemm", "gemm_i4")
 
 kernels = None
 originals = {}
@@ -23,6 +26,10 @@ fusable = False
 pending = None
 # Set by linear_input_act when the next linear gets the raw [hidden | gate] input of a situ activation.
 situ_next = False
+# Set when the next linear gets a SwiGLU gate as its input, with this as the up projection.
+swiglu_up = None
+# The Int8 layer only reaches wrap through the Triton path of int8_quant.
+swiglu_fusable = False
 
 
 def get_kernels():
@@ -32,7 +39,7 @@ def get_kernels():
     return kernels
 
 
-def run(quant, gemm, x, weight, weight_scale, bias, K):
+def run(quant, gemm, x, weight, weight_scale, bias, K, up=None):
     """K is the number of values per row. weight is (N, row_bytes) int8 and weight_scale (N,) fp32. Returns (M, N) fp16."""
     M = x.shape[0]
     N, row_bytes = weight.shape
@@ -45,7 +52,8 @@ def run(quant, gemm, x, weight, weight_scale, bias, K):
 
     c_int, c_ptr = ctypes.c_int, ctypes.c_void_p
     rotates = quant is not get_kernels().quant_pack_a
-    launch(quant, M, 1, ROT_THREADS if rotates else 256, [c_ptr(x.data_ptr()), c_ptr(packed_a.data_ptr()), c_ptr(a_scale.data_ptr()), c_int(K)], K * 2 if rotates else 0)
+    inputs = [c_ptr(x.data_ptr())] if up is None else [c_ptr(x.data_ptr()), c_ptr(up.data_ptr())]
+    launch(quant, M, 1, ROT_THREADS if rotates else 256, [*inputs, c_ptr(packed_a.data_ptr()), c_ptr(a_scale.data_ptr()), c_int(K)], K * 2 if rotates else 0)
     launch(get_kernels().pack_b, row_bytes // 64, N // 64, 256, [c_ptr(weight.data_ptr()), c_ptr(packed_b.data_ptr()), c_int(row_bytes)])
     launch(gemm, blocks, N // 64, 256, [
         c_ptr(packed_a.data_ptr()), c_ptr(packed_b.data_ptr()), c_ptr(a_scale.data_ptr()), c_ptr(weight_scale.data_ptr()),
@@ -53,11 +61,11 @@ def run(quant, gemm, x, weight, weight_scale, bias, K):
     return out
 
 
-def linear(x, weight, weight_scale, bias, rotate=False, situ=False):
-    """x is (M, K) fp16, or (M, 2K) with situ, weight (N, K) int8 and weight_scale (N,) fp32. Returns (M, N) fp16."""
+def linear(x, weight, weight_scale, bias, rotate=False, situ=False, up=None):
+    """x is (M, K) fp16, or (M, 2K) with situ, weight (N, K) int8 and weight_scale (N,) fp32. With up, x is the gate of a SwiGLU. Returns (M, N) fp16."""
     k = get_kernels()
-    quant = k.situ_rot_quant_pack_a if situ else k.rot_quant_pack_a if rotate else k.quant_pack_a
-    return run(quant, k.gemm, x, weight, weight_scale, bias, weight.shape[1])
+    quant = k.swiglu_rot_quant_pack_a if up is not None else k.situ_rot_quant_pack_a if situ else k.rot_quant_pack_a if rotate else k.quant_pack_a
+    return run(quant, k.gemm, x, weight, weight_scale, bias, weight.shape[1], up)
 
 
 def wrap_w4a4(original):
@@ -77,14 +85,16 @@ def wrap_w4a4(original):
 
 def wrap(original):
     def int8_linear(x, weight, weight_scale, bias=None, compute_dtype=torch.float16, x_q=None):
-        global pending, situ_next
-        rotate, situ = x is pending, situ_next
-        pending, situ_next = None, False
+        global pending, situ_next, swiglu_up
+        rotate, situ, up = x is pending, situ_next, swiglu_up
+        pending, situ_next, swiglu_up = None, False, None
         N, K = weight.shape
         if (x_q is not None or x.dtype != torch.float16 or compute_dtype != torch.float16 or (bias is not None and bias.dtype != torch.float16)
                 or x.numel() // x.shape[-1] < MIN_ROWS or N % 64 != 0 or K % 64 != 0):
             if situ:
                 x = originals["eager_input_act"](x, "situ")
+            if up is not None:
+                x = F.silu(x).mul_(up)
             if rotate:
                 x = originals["rotate_activation"](x, originals["build_hadamard"](ROT_GROUP, device=x.device, dtype=x.dtype), ROT_GROUP)
             return original(x, weight, weight_scale, bias, compute_dtype, x_q)
@@ -93,14 +103,14 @@ def wrap(original):
             scale = weight_scale.reshape(N).float().contiguous()
         else:
             scale = torch.full((N,), float(weight_scale), dtype=torch.float32, device=x.device)
-        out = linear(x.reshape(-1, x.shape[-1]).contiguous(), weight.contiguous(), scale, bias, rotate, situ)
+        out = linear(x.reshape(-1, x.shape[-1]).contiguous(), weight.contiguous(), scale, bias, rotate, situ, None if up is None else up.reshape(-1, K).contiguous())
         return out.reshape(x.shape[:-1] + (N,))
     return int8_linear
 
 
 def rotate_activation(x, H, group_size):
     global pending
-    if situ_next:
+    if situ_next or swiglu_up is not None:
         pending = x
         return x
     if fusable and group_size == ROT_GROUP and x.dtype == torch.float16 and x.dim() == 2 and x.shape[1] % ROT_GROUP == 0 and x.shape[1] <= MAX_ROT_K:
@@ -109,19 +119,35 @@ def rotate_activation(x, H, group_size):
     return originals["rotate_activation"](x, H, group_size)
 
 
-def fuse_situ(layer, x):
-    """Only for layers where the kernel can do situ, ConvRot and the quantization in one pass."""
+def fuse_act(layer, x, K):
+    """Only for layers where the kernel can do the activation, ConvRot and the quantization in one pass. K is the width of the activation."""
     return (getattr(layer, "_is_quantized", False) and getattr(layer, "_use_convrot", False) and not getattr(layer, "_is_w4a8", False)
             and getattr(layer, "_convrot_groupsize", 0) == ROT_GROUP and not layer.lora_patches and x.dtype == torch.float16
-            and x.shape[-1] // 2 == layer.in_features and layer.in_features % ROT_GROUP == 0 and layer.in_features <= MAX_ROT_K)
+            and K == layer.in_features and layer.in_features % ROT_GROUP == 0 and layer.in_features <= MAX_ROT_K)
 
 
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0, residual=None, residual_scale=None):
     global situ_next
-    if input_act == "situ" and residual is None and fuse_situ(linear, x):
+    if input_act == "situ" and residual is None and fuse_act(linear, x, x.shape[-1] // 2):
         situ_next = True
         return linear(x)
     return originals["linear_input_act"](linear, x, input_act, act_weight, act_eps, residual, residual_scale)
+
+
+def swiglu_forward(module, x):
+    global swiglu_up
+    gate, up = module.gate(x), module.up(x)
+    # Int4 layers have the same flags but never reach wrap.
+    if swiglu_fusable and isinstance(module.down, originals["layer"]) and fuse_act(module.down, gate, gate.shape[-1]):
+        swiglu_up = up
+        return module.down(gate)
+    return module.down(F.silu(gate).mul_(up))
+
+
+def patch_swiglu(model):
+    for name, module in model.get_model_object("diffusion_model").named_modules():
+        if isinstance(module, SwiGLU):
+            model.add_object_patch(f"diffusion_model.{name}.forward", functools.partial(swiglu_forward, module))
 
 
 def wrap_forward(forward):
@@ -137,6 +163,7 @@ def wrap_forward(forward):
 
 
 def enable(on):
+    global swiglu_fusable
     pack = next((m for name, m in sys.modules.items() if name.endswith(".int8_quant") and hasattr(m, "triton_int8_linear_per_row")), None)
     int4 = next((m for name, m in sys.modules.items() if name.endswith(".int4_quant") and hasattr(m, "convrot_w4a4_forward")), None)
     if int4 is not None:
@@ -150,7 +177,7 @@ def enable(on):
     convrot = next(m for name, m in sys.modules.items() if name.endswith(".convrot") and hasattr(m, "rotate_activation"))
     layer = pack.Int8TensorwiseOps.Linear
     if "forward" not in originals:
-        originals.update(triton_int8_linear=pack.triton_int8_linear, triton_int8_linear_per_row=pack.triton_int8_linear_per_row,
+        originals.update(layer=layer, triton_int8_linear=pack.triton_int8_linear, triton_int8_linear_per_row=pack.triton_int8_linear_per_row,
                          rotate_activation=convrot.rotate_activation, build_hadamard=convrot.build_hadamard, forward=layer.forward,
                          linear_input_act=comfy.ops.linear_input_act, eager_input_act=comfy.ops._eager_input_act)
 
@@ -159,3 +186,4 @@ def enable(on):
     convrot.rotate_activation = rotate_activation if on else originals["rotate_activation"]
     layer.forward = wrap_forward(originals["forward"]) if on else originals["forward"]
     comfy.ops.linear_input_act = linear_input_act if on else originals["linear_input_act"]
+    swiglu_fusable = on and pack._TRITON_AVAILABLE

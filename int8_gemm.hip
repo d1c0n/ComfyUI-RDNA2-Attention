@@ -16,6 +16,7 @@ typedef const __attribute__((address_space(4))) char* cchar;
 #define WARM_AT 8
 #define WARM_LINES (64 / WAVES)
 #define FENCE __builtin_amdgcn_sched_barrier(0)
+enum Act { NO_ACT, SITU, SWIGLU };
 template <bool I4> __device__ __forceinline__ int dot(u32 a, u32 b, int c) {
     return I4 ? __builtin_amdgcn_sdot8((int)a, (int)b, c, false) : __builtin_amdgcn_sdot4((int)a, (int)b, c, false);
 }
@@ -120,6 +121,11 @@ __device__ __forceinline__ float situ(float hidden, float gate) {
     return (float)(_Float16)(4.f * soft_tanh(gate * 0.25f) * sigmoid * 25.f * soft_tanh(hidden * 0.04f));
 }
 
+// Rounds to fp16 at the same points as F.silu(gate).mul_(up).
+__device__ __forceinline__ float swiglu(float gate, float up) {
+    return (float)(_Float16)((float)(_Float16)(gate / (1.f + expf(-gate))) * up);
+}
+
 __device__ __forceinline__ void wave_sync() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
@@ -127,15 +133,17 @@ __device__ __forceinline__ void wave_sync() {
 }
 
 // quant_pack_a after a ConvRot rotation of every 256 elements. 16 lanes share a group: two digits in registers, an LDS transpose, two more.
-// SITU reads a 2K wide [hidden | gate] row and applies the activation first, so the K wide activation never goes through VRAM.
-template <bool SITU, bool I4>
-__device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+// SITU reads a 2K wide [hidden | gate] row and SWIGLU a gate row from X and an up row from U. Both apply the activation first, so the K wide
+// activation never goes through VRAM.
+template <Act ACT, bool I4>
+__device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, const _Float16* __restrict__ U, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     __shared__ float red[ROT_WAVES];
     __shared__ float swap[ROT_WAVES][2][16 * 17];
     // Sized to K at launch. A fixed maximum would leave room for far fewer blocks per WGP.
     extern __shared__ __attribute__((aligned(16))) _Float16 rotated[];
     const int wave = threadIdx.x >> 5, half = (threadIdx.x >> 4) & 1, c = threadIdx.x & 15, groups = K / 256;
-    const h8* x = (const h8*)(X + (size_t)blockIdx.x * K * (SITU ? 2 : 1));
+    const h8* x = (const h8*)(X + (size_t)blockIdx.x * K * (ACT == SITU ? 2 : 1));
+    const h8* u = (const h8*)(U + (size_t)blockIdx.x * K);
     float* sw = swap[wave][half];
     float mx = 0.f;
     for (int g = wave * 2 + half; g < (groups + 1) / 2 * 2; g += ROT_WAVES * 2) {
@@ -143,10 +151,14 @@ __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __
         float v[16];
         if (active) {
             h8 lo = x[g * 32 + c * 2], hi = x[g * 32 + c * 2 + 1];
-            if (SITU) {
+            if (ACT == SITU) {
                 h8 glo = x[K / 8 + g * 32 + c * 2], ghi = x[K / 8 + g * 32 + c * 2 + 1];
 #pragma unroll
                 for (int i = 0; i < 8; i++) { v[i] = situ((float)lo[i], (float)glo[i]); v[8 + i] = situ((float)hi[i], (float)ghi[i]); }
+            } else if (ACT == SWIGLU) {
+                h8 ulo = u[g * 32 + c * 2], uhi = u[g * 32 + c * 2 + 1];
+#pragma unroll
+                for (int i = 0; i < 8; i++) { v[i] = swiglu((float)lo[i], (float)ulo[i]); v[8 + i] = swiglu((float)hi[i], (float)uhi[i]); }
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; i++) { v[i] = (float)lo[i]; v[8 + i] = (float)hi[i]; }
@@ -175,15 +187,19 @@ __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __
 }
 
 extern "C" __global__ __launch_bounds__(ROT_THREADS) void rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
-    rot_quant<false, false>(X, Ap, as, K);
+    rot_quant<NO_ACT, false>(X, nullptr, Ap, as, K);
 }
 
 extern "C" __global__ __launch_bounds__(ROT_THREADS) void situ_rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
-    rot_quant<true, false>(X, Ap, as, K);
+    rot_quant<SITU, false>(X, nullptr, Ap, as, K);
+}
+
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void swiglu_rot_quant_pack_a(const _Float16* __restrict__ X, const _Float16* __restrict__ U, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+    rot_quant<SWIGLU, false>(X, U, Ap, as, K);
 }
 
 extern "C" __global__ __launch_bounds__(ROT_THREADS) void rot_quant_pack_a_i4(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
-    rot_quant<false, true>(X, Ap, as, K);
+    rot_quant<NO_ACT, true>(X, nullptr, Ap, as, K);
 }
 
 // Reorders weights into the stream gemm reads. Runs on every call: a temporary copy is far cheaper than keeping a second model in VRAM.

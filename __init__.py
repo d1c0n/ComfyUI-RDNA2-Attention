@@ -47,17 +47,21 @@ class RDNA2Attention(io.ComfyNode):
                                  tooltip="Run Load Diffusion Model Int8 layers on the fast scalar-fed kernel. Stays active for every workflow until a node turns it off."),
                 io.Boolean.Input("fused_norm", default=False,
                                  tooltip="Krea 2 only: run RMSNorm as one fp16 kernel instead of casting to fp32 and back. About 1 value in 12000 changes by one fp16 step, which can still change the image."),
+                io.Boolean.Input("fused_swiglu", default=False,
+                                 tooltip="Krea 2 Int8 only, needs int8_gemm: fold the SwiGLU activation into the quantization of the down layer. Other layers run as before."),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, backend, transpose_weights=False, int8_gemm=False, fused_norm=False) -> io.NodeOutput:
+    def execute(cls, model, backend, transpose_weights=False, int8_gemm=False, fused_norm=False, fused_swiglu=False) -> io.NodeOutput:
         m = model.clone()
         int8_kernels.enable(int8_gemm)
         m.set_model_optimized_attention(BACKENDS[backend])
         if fused_norm:
             rms_norm.patch(m)
+        if fused_swiglu:
+            int8_kernels.patch_swiglu(m)
         if transpose_weights:
             # Dynamic VRAM rebuilds weights from flat contiguous buffers, so it can't keep this layout.
             if m.is_dynamic():

@@ -11,7 +11,8 @@ typedef const __attribute__((address_space(4))) s16* cs16;
 typedef const __attribute__((address_space(4))) u32* cu32;
 typedef const __attribute__((address_space(4))) char* cchar;
 #define WAVES 8
-#define MAX_ROT_K 16384
+#define ROT_WAVES 4
+#define ROT_THREADS (ROT_WAVES * 32)
 #define WARM_AT 8
 #define WARM_LINES (64 / WAVES)
 #define FENCE __builtin_amdgcn_sched_barrier(0)
@@ -19,6 +20,7 @@ template <bool I4> __device__ __forceinline__ int dot(u32 a, u32 b, int c) {
     return I4 ? __builtin_amdgcn_sdot8((int)a, (int)b, c, false) : __builtin_amdgcn_sdot4((int)a, (int)b, c, false);
 }
 // Quantizes a row like triton_quantize_rowwise and writes it as gemm reads it: u4 index ((kc * 2 + r) * 4 + q) * 32 + lane.
+template <int NW>
 __device__ __forceinline__ void quant_row(const h8* x, float mx, float* red, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     const int row = blockIdx.x, t = threadIdx.x;
 #pragma unroll
@@ -26,13 +28,13 @@ __device__ __forceinline__ void quant_row(const h8* x, float mx, float* red, u4*
     if ((t & 31) == 0) red[t >> 5] = mx;
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < 8; i++) mx = fmaxf(mx, red[i]);
+    for (int i = 0; i < NW; i++) mx = fmaxf(mx, red[i]);
     const float scale = fmaxf(mx / 127.f, 1e-30f);
     if (t == 0) as[row] = scale;
 
     const int KCs = K / 64, wt = row >> 6, r = (row >> 5) & 1, lane = row & 31;
     u4* out = Ap + (size_t)wt * KCs * 256 + r * 128 + lane;
-    for (int g = t; g < K / 16; g += 256) {
+    for (int g = t; g < K / 16; g += NW * 32) {
         h8 lo = x[g * 2], hi = x[g * 2 + 1];
         u4 o;
 #pragma unroll
@@ -59,13 +61,13 @@ __device__ __forceinline__ void quant_row_i4(const h8* x, float mx, float* red, 
     if ((t & 31) == 0) red[t >> 5] = mx;
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < 8; i++) mx = fmaxf(mx, red[i]);
+    for (int i = 0; i < ROT_WAVES; i++) mx = fmaxf(mx, red[i]);
     const float scale = fmaxf(mx, 1e-10f) / 7.f;
     if (t == 0) as[row] = scale;
 
     const int KCs = K / 128, wt = row >> 6, r = (row >> 5) & 1, lane = row & 31;
     u4* out = Ap + (size_t)wt * KCs * 256 + r * 128 + lane;
-    for (int g = t; g < K / 32; g += 256) {
+    for (int g = t; g < K / 32; g += ROT_THREADS) {
         u4 o;
 #pragma unroll
         for (int d = 0; d < 4; d++) {
@@ -91,7 +93,7 @@ extern "C" __global__ __launch_bounds__(256) void quant_pack_a(const _Float16* _
 #pragma unroll
         for (int j = 0; j < 8; j++) mx = fmaxf(mx, fabsf((float)v[j]));
     }
-    quant_row(x, mx, red, Ap, as, K);
+    quant_row<8>(x, mx, red, Ap, as, K);
 }
 
 // The ConvRot matrix is a Kronecker power of a 4x4 Hadamard H4, so each base 4 digit of the index is one H4 step.
@@ -122,14 +124,15 @@ __device__ __forceinline__ float situ(float hidden, float gate) {
 // SITU reads a 2K wide [hidden | gate] row and applies the activation first, so the K wide activation never goes through VRAM.
 template <bool SITU, bool I4>
 __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
-    __shared__ float red[8];
-    __shared__ float swap[8][2][16 * 17];
-    __shared__ __attribute__((aligned(16))) _Float16 rotated[MAX_ROT_K];
+    __shared__ float red[ROT_WAVES];
+    __shared__ float swap[ROT_WAVES][2][16 * 17];
+    // Sized to K at launch. A fixed maximum would leave room for far fewer blocks per WGP.
+    extern __shared__ __attribute__((aligned(16))) _Float16 rotated[];
     const int wave = threadIdx.x >> 5, half = (threadIdx.x >> 4) & 1, c = threadIdx.x & 15, groups = K / 256;
     const h8* x = (const h8*)(X + (size_t)blockIdx.x * K * (SITU ? 2 : 1));
     float* sw = swap[wave][half];
     float mx = 0.f;
-    for (int g = wave * 2 + half; g < (groups + 1) / 2 * 2; g += 16) {
+    for (int g = wave * 2 + half; g < (groups + 1) / 2 * 2; g += ROT_WAVES * 2) {
         const bool active = g < groups;
         float v[16];
         if (active) {
@@ -166,18 +169,18 @@ __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __
     }
     __syncthreads();
     if (I4) quant_row_i4((const h8*)rotated, mx, red, Ap, as, K);
-    else quant_row((const h8*)rotated, mx, red, Ap, as, K);
+    else quant_row<ROT_WAVES>((const h8*)rotated, mx, red, Ap, as, K);
 }
 
-extern "C" __global__ __launch_bounds__(256) void rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     rot_quant<false, false>(X, Ap, as, K);
 }
 
-extern "C" __global__ __launch_bounds__(256) void situ_rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void situ_rot_quant_pack_a(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     rot_quant<true, false>(X, Ap, as, K);
 }
 
-extern "C" __global__ __launch_bounds__(256) void rot_quant_pack_a_i4(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
+extern "C" __global__ __launch_bounds__(ROT_THREADS) void rot_quant_pack_a_i4(const _Float16* __restrict__ X, u4* __restrict__ Ap, float* __restrict__ as, int K) {
     rot_quant<false, true>(X, Ap, as, K);
 }
 

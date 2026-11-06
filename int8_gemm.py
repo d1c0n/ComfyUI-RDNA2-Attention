@@ -9,8 +9,9 @@ import comfy.ops
 from .hip_attention import Kernels, launch
 
 BLOCK_ROWS = 512  # WAVES * 64 in int8_gemm.hip
+ROT_THREADS = 128  # ROT_THREADS in int8_gemm.hip
 MIN_ROWS = 512  # Below this the weight packing costs more than the kernel saves.
-MAX_ROT_K = 16384  # Size of the row buffer in rot_quant_pack_a.
+MAX_ROT_K = 16384  # Keeps the rotated row within the LDS of a block.
 ROT_GROUP = 256
 
 KERNELS = ("quant_pack_a", "rot_quant_pack_a", "situ_rot_quant_pack_a", "rot_quant_pack_a_i4", "pack_b", "gemm", "gemm_i4")
@@ -43,7 +44,8 @@ def run(quant, gemm, x, weight, weight_scale, bias, K):
     out = torch.empty((M, N), dtype=torch.float16, device=x.device)
 
     c_int, c_ptr = ctypes.c_int, ctypes.c_void_p
-    launch(quant, M, 1, 256, [c_ptr(x.data_ptr()), c_ptr(packed_a.data_ptr()), c_ptr(a_scale.data_ptr()), c_int(K)])
+    rotates = quant is not get_kernels().quant_pack_a
+    launch(quant, M, 1, ROT_THREADS if rotates else 256, [c_ptr(x.data_ptr()), c_ptr(packed_a.data_ptr()), c_ptr(a_scale.data_ptr()), c_int(K)], K * 2 if rotates else 0)
     launch(get_kernels().pack_b, row_bytes // 64, N // 64, 256, [c_ptr(weight.data_ptr()), c_ptr(packed_b.data_ptr()), c_int(row_bytes)])
     launch(gemm, blocks, N // 64, 256, [
         c_ptr(packed_a.data_ptr()), c_ptr(packed_b.data_ptr()), c_ptr(a_scale.data_ptr()), c_ptr(weight_scale.data_ptr()),

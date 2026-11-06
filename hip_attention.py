@@ -36,10 +36,10 @@ class Kernels:
             setattr(self, function, func)
 
 
-def launch(func, grid_x, grid_y, block, args):
+def launch(func, grid_x, grid_y, block, args, shared=0):
     pointers = (ctypes.c_void_p * len(args))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args])
     stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    check(hip.hipModuleLaunchKernel(func, grid_x, grid_y, 1, block, 1, 1, 0, stream, pointers, None))
+    check(hip.hipModuleLaunchKernel(func, grid_x, grid_y, 1, block, 1, 1, shared, stream, pointers, None))
 
 
 kernels = None

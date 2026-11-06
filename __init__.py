@@ -9,6 +9,7 @@ from comfy.quant_ops import QuantizedTensor
 from comfy_api.latest import ComfyExtension, io
 
 from . import int8_gemm as int8_kernels
+from . import rms_norm
 from .attention import attention_bmm, attention_hip, attention_hip_int8
 
 BACKENDS = {"hip": attention_hip, "hip_int8": attention_hip_int8, "bmm": attention_bmm}
@@ -44,15 +45,19 @@ class RDNA2Attention(io.ComfyNode):
                                  tooltip="Store fp16 weights K-major for about 1.09x faster steps. Needs --highvram or --disable-dynamic-vram, it is skipped with dynamic VRAM."),
                 io.Boolean.Input("int8_gemm", default=False,
                                  tooltip="Run Load Diffusion Model Int8 layers on the fast scalar-fed kernel. Stays active for every workflow until a node turns it off."),
+                io.Boolean.Input("fused_norm", default=False,
+                                 tooltip="Krea 2 only: run RMSNorm as one fp16 kernel instead of casting to fp32 and back. About 1 value in 12000 changes by one fp16 step, which can still change the image."),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, backend, transpose_weights=False, int8_gemm=False) -> io.NodeOutput:
+    def execute(cls, model, backend, transpose_weights=False, int8_gemm=False, fused_norm=False) -> io.NodeOutput:
         m = model.clone()
         int8_kernels.enable(int8_gemm)
         m.set_model_optimized_attention(BACKENDS[backend])
+        if fused_norm:
+            rms_norm.patch(m)
         if transpose_weights:
             # Dynamic VRAM rebuilds weights from flat contiguous buffers, so it can't keep this layout.
             if m.is_dynamic():

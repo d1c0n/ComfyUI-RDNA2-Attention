@@ -9,6 +9,7 @@ from comfy.quant_ops import QuantizedTensor
 from comfy_api.latest import ComfyExtension, io
 
 from . import int8_gemm as int8_kernels
+from . import int8_gemv
 from . import rms_norm
 from .attention import attention_bmm, attention_hip, attention_hip_int8
 
@@ -71,10 +72,29 @@ class RDNA2Attention(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class RDNA2TextGenerate(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="RDNA2TextGenerate",
+            display_name="RDNA2 Text Generate",
+            category="model/patch",
+            description="Much faster Generate Text with int8 text encoders on RX 6900 XT class GPUs (gfx1030). Only single token steps change, so prompt encoding is unaffected.",
+            inputs=[io.Clip.Input("clip")],
+            outputs=[io.Clip.Output()],
+        )
+
+    @classmethod
+    def execute(cls, clip) -> io.NodeOutput:
+        clip = clip.clone()
+        int8_gemv.patch(clip)
+        return io.NodeOutput(clip)
+
+
 class RDNA2AttentionExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [RDNA2Attention]
+        return [RDNA2Attention, RDNA2TextGenerate]
 
 
 async def comfy_entrypoint() -> RDNA2AttentionExtension:

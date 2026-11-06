@@ -49,6 +49,16 @@ Model loader -> LoRAs -> RDNA2 Attention -> KSampler
 
 Anything the fast kernels cannot handle falls back automatically. `hip` needs fp16 and head size 128, without masks, so SDXL uses `bmm`. `int8_gemm` needs at least 512 rows.
 
+### Text generation
+
+Add **RDNA2 Text Generate** after the CLIP loader and connect it to both Generate Text and CLIP Text Encode:
+
+```
+CLIP loader -> RDNA2 Text Generate -> Generate Text, CLIP Text Encode
+```
+
+ComfyUI otherwise dequantizes every int8 weight on every generated token on this card. The node reads the weights directly on single token steps, about 10x faster per token with the same output. Prompt encoding does not change. It needs an int8 text encoder for the linear layers. Layers with LoRA patches fall back.
+
 ## Recommended setup per model
 
 Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dtype` to fp16.

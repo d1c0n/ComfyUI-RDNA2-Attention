@@ -17,6 +17,8 @@ Seconds per image on an RX 6900 XT, 8 steps. Your numbers will vary.
 | Krea 2, tuned int4 file, 856x856 | 26.7s (Triton int4) | 9.0-9.4s |
 | MOSS-Image, int8, CFG 3, 704x1056 | 20.5s (normal loader) | 11.0-11.6s |
 
+These numbers are from before the latest GEMM and Krea 2 block work. A full Krea 2 int8 image at 840x1256 with prompt enhancement now takes about 19-21s, with 1.79s per step.
+
 ## Requirements
 
 - An RDNA2 GPU with gfx1030: RX 6800, 6800 XT, 6900 XT or 6950 XT. The kernels are compiled for gfx1030 only.
@@ -46,10 +48,10 @@ Model loader -> LoRAs -> RDNA2 Attention -> KSampler
 | `backend` | `hip` is the fused attention kernel, and the best default. `hip_int8` uses int8 for `QK`, which is about 5% faster overall and slightly less exact. `bmm` uses rocBLAS matmuls. |
 | `int8_gemm` | Runs models from the Int8 and Int4 loaders on faster kernels. Needs ComfyUI-INT8-Fast-ROCM. |
 | `fused_norm` | Krea 2 only. Runs RMSNorm as one fp16 kernel instead of casting to fp32 and back, which is 7-10% faster overall. Accuracy is the same, but the same seed can give a different image. |
-| `fused_swiglu` | Krea 2 int8 files only, needs `int8_gemm`. Folds the SwiGLU activation into the quantization of the `down` layer, about 2% faster overall. Images do not change. |
+| `fused_swiglu` | Krea 2 int8 files only, needs `int8_gemm`. Folds the SwiGLU activation into the quantization of the `down` layer, about 2% faster overall. Images do not change. With `fused_norm` and a `hip` backend, it also fuses everything between the matmuls of a block, which is about 6% faster with the same images. |
 | `transpose_weights` | Experimental, leave it off. Not tested on real workflows, and it is skipped under dynamic VRAM. |
 
-Anything the fast kernels cannot handle falls back automatically. `hip` needs fp16 and head size 128, without masks, so SDXL uses `bmm`. `int8_gemm` needs at least 512 rows. `fused_norm` needs fp16. `fused_swiglu` skips int4 layers, unquantized layers and layers with Dynamic LoRA patches.
+Anything the fast kernels cannot handle falls back automatically. `hip` needs fp16 and head size 128, without masks, so SDXL uses `bmm`. `int8_gemm` needs at least 512 rows. `fused_norm` needs fp16. `fused_swiglu` skips int4 layers, unquantized layers and layers with Dynamic LoRA patches. The fused block also skips attention patches and reference images.
 
 ### Text generation
 
@@ -59,7 +61,7 @@ Add **RDNA2 Text Generate** after the CLIP loader and connect it to both Generat
 CLIP loader -> RDNA2 Text Generate -> Generate Text, CLIP Text Encode
 ```
 
-ComfyUI otherwise dequantizes every int8 weight on every generated token on this card. The node reads the weights directly on single token steps and adds the fp32 decode attention that lets ComfyUI replay each layer from a graph, about 20x faster per token with the same output. Graphs need dynamic VRAM, without them it is about 8x. Prompt encoding does not change. It needs an int8 text encoder for the linear layers. Layers with LoRA patches fall back.
+ComfyUI otherwise dequantizes every int8 weight on every generated token on this card. The node reads the weights directly on single token steps and adds the fp32 decode attention that lets ComfyUI replay each layer from a graph, about 20x faster per token with the same output. Graphs need dynamic VRAM, without them it is about 8x. It also speeds up the prefill of Generate Text, which keeps the same text in testing but is not exact to the last bit. Prompt encoding does not change. It needs an int8 text encoder for the linear layers. Layers with LoRA patches fall back.
 
 ## Recommended setup per model
 
@@ -82,6 +84,7 @@ Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dt
 **LoRAs**
 
 - On the Int8 loader, use `lora_mode` **Stochastic**. The default, None, visibly broke the MOSS DMD LoRA. Stochastic stays clean at full speed.
+- With `lora_mode` None under dynamic VRAM, the same seed can give a different image at a different `--vram-headroom`. The cause is not determined.
 - LoRAs on int4 are untested. None and Stochastic re-round patched layers, which may discard tuning. Dynamic avoids that, but those layers fall back to the slower Triton path.
 
 **Side effects to know about**
@@ -103,7 +106,7 @@ Tiled kernels on RDNA2 stall near 50% of peak because they run out of LDS bandwi
 - The other operand is identical across the wave, so it streams through the scalar cache and is read directly as an SGPR operand of the dot instructions, at full rate.
 - Waves in a block warm the scalar cache together, so misses overlap instead of stalling one at a time.
 
-The int8 and int4 matmuls use `v_dot4c_i32_i8` and `v_dot8_i32_i4` this way, reaching about 65 and 100-120 TOPS. ConvRot, quantization and the `situ` or SwiGLU activation are fused into one pass over the activations.
+The int8 and int4 matmuls use `v_dot4c_i32_i8` and `v_dot8_i32_i4` this way, reaching about 75 and 100-120 TOPS. ConvRot, quantization and the `situ` or SwiGLU activation are fused into one pass over the activations.
 
 ## License
 

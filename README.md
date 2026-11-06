@@ -45,9 +45,11 @@ Model loader -> LoRAs -> RDNA2 Attention -> KSampler
 |---|---|
 | `backend` | `hip` is the fused attention kernel, and the best default. `hip_int8` uses int8 for `QK`, which is about 5% faster overall and slightly less exact. `bmm` uses rocBLAS matmuls. |
 | `int8_gemm` | Runs models from the Int8 and Int4 loaders on faster kernels. Needs ComfyUI-INT8-Fast-ROCM. |
+| `fused_norm` | Krea 2 only. Runs RMSNorm as one fp16 kernel instead of casting to fp32 and back, which is 7-10% faster overall. Accuracy is the same, but the same seed can give a different image. |
+| `fused_swiglu` | Krea 2 int8 files only, needs `int8_gemm`. Folds the SwiGLU activation into the quantization of the `down` layer, about 2% faster overall. Images do not change. |
 | `transpose_weights` | Experimental, leave it off. Not tested on real workflows, and it is skipped under dynamic VRAM. |
 
-Anything the fast kernels cannot handle falls back automatically. `hip` needs fp16 and head size 128, without masks, so SDXL uses `bmm`. `int8_gemm` needs at least 512 rows.
+Anything the fast kernels cannot handle falls back automatically. `hip` needs fp16 and head size 128, without masks, so SDXL uses `bmm`. `int8_gemm` needs at least 512 rows. `fused_norm` needs fp16. `fused_swiglu` skips int4 layers, unquantized layers and layers with Dynamic LoRA patches.
 
 ### Text generation
 
@@ -61,7 +63,7 @@ ComfyUI otherwise dequantizes every int8 weight on every generated token on this
 
 ## Recommended setup per model
 
-Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dtype` to fp16.
+Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dtype` to fp16. For Krea 2, also tick `fused_norm`, plus `fused_swiglu` on the int8 file.
 
 | Model | Loader | `model_type` | On-the-fly | ConvRot |
 |---|---|---|---|---|
@@ -76,18 +78,11 @@ Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dt
 **Quality**
 
 - Images will not match other backends exactly on the same seed. These models amplify tiny numeric changes, so details shift.
-- **Only use int4 with files tuned for it.** Plain int4 conversion ruined both Anima and MOSS. The Krea file works because it was specifically tuned after quantization.
-- Int8 looked excellent on all three models.
 
 **LoRAs**
 
 - On the Int8 loader, use `lora_mode` **Stochastic**. The default, None, visibly broke the MOSS DMD LoRA. Stochastic stays clean at full speed.
 - LoRAs on int4 are untested. None and Stochastic re-round patched layers, which may discard tuning. Dynamic avoids that, but those layers fall back to the slower Triton path.
-
-**Memory**
-
-- Large models can run out of VRAM under dynamic VRAM. If Krea fails with `CUDA error: out of memory`, launch with `--vram-headroom 1`. It made no difference to speed in testing.
-- `--highvram` turns dynamic VRAM off.
 
 **Side effects to know about**
 
@@ -97,7 +92,6 @@ Tick `int8_gemm` for the models that use the Int8 or Int4 loader. Set `weight_dt
 
 **Other**
 
-- Avoid `--fast autotune`. In testing it did not finish the first VAE decode within about 4 minutes.
 - The Int4 loader's on-the-fly mode crashes in the version tested, and it does not convert int8 files to int4.
 - `prototypes/` holds the original benchmark code and is not used by the node.
 
@@ -109,7 +103,7 @@ Tiled kernels on RDNA2 stall near 50% of peak because they run out of LDS bandwi
 - The other operand is identical across the wave, so it streams through the scalar cache and is read directly as an SGPR operand of the dot instructions, at full rate.
 - Waves in a block warm the scalar cache together, so misses overlap instead of stalling one at a time.
 
-The int8 and int4 matmuls use `v_dot4c_i32_i8` and `v_dot8_i32_i4` this way, reaching about 65 and 100-120 TOPS. ConvRot, quantization and `situ` are fused into one pass over the activations.
+The int8 and int4 matmuls use `v_dot4c_i32_i8` and `v_dot8_i32_i4` this way, reaching about 65 and 100-120 TOPS. ConvRot, quantization and the `situ` or SwiGLU activation are fused into one pass over the activations.
 
 ## License
 

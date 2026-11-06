@@ -120,6 +120,12 @@ __device__ __forceinline__ float situ(float hidden, float gate) {
     return (float)(_Float16)(4.f * soft_tanh(gate * 0.25f) * sigmoid * 25.f * soft_tanh(hidden * 0.04f));
 }
 
+__device__ __forceinline__ void wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
 // quant_pack_a after a ConvRot rotation of every 256 elements. 16 lanes share a group: two digits in registers, an LDS transpose, two more.
 // SITU reads a 2K wide [hidden | gate] row and applies the activation first, so the K wide activation never goes through VRAM.
 template <bool SITU, bool I4>
@@ -149,9 +155,7 @@ __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __
 #pragma unroll
             for (int i = 0; i < 16; i++) sw[c * 17 + i] = v[i];
         }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        wave_sync();
         if (active) {
 #pragma unroll
             for (int i = 0; i < 16; i++) v[i] = sw[i * 17 + c];
@@ -163,9 +167,7 @@ __device__ __forceinline__ void rot_quant(const _Float16* __restrict__ X, u4* __
                 mx = fmaxf(mx, fabsf((float)y));
             }
         }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        wave_sync();
     }
     __syncthreads();
     if (I4) quant_row_i4((const h8*)rotated, mx, red, Ap, as, K);
@@ -261,24 +263,31 @@ __device__ __forceinline__ void gemm_body(const u4* __restrict__ Ap, const u32* 
 #pragma unroll
             for (int i = 0; i < 16; i++) a[r][i] = an[r][i];
     }
+    // Lanes own rows, so storing from registers writes 16 bytes to each of 32 rows, and power of two row pitches
+    // put those on few memory channels. Going through LDS lets each store write whole 128 byte row segments.
+    __shared__ h8 tile[WAVES][32][9];
 #pragma unroll
     for (int r = 0; r < 2; r++) {
-        int row = wt * 64 + r * 32 + lane;
-        if (row < M) {
-            float s = as[row];
-            _Float16* cp = C + (size_t)row * N + nt * 64;
+        const int base = wt * 64 + r * 32, row = base + lane;
+        const float s = row < M ? as[row] : 0.f;
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                h8 v;
+        for (int i = 0; i < 8; i++) {
+            h8 v;
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    int n = nt * 64 + i * 8 + j;
-                    float y = (float)acc[r][i * 8 + j] * s * ws[n];
-                    v[j] = (_Float16)(bias ? y + (float)bias[n] : y);
-                }
-                *(h8*)(cp + i * 8) = v;
+            for (int j = 0; j < 8; j++) {
+                int n = nt * 64 + i * 8 + j;
+                float y = (float)acc[r][i * 8 + j] * s * ws[n];
+                v[j] = (_Float16)(bias ? y + (float)bias[n] : y);
             }
+            tile[wave][lane][i] = v;
         }
+        wave_sync();
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int local = i * 4 + (lane >> 3), col = lane & 7;
+            if (base + local < M) *(h8*)(C + (size_t)(base + local) * N + nt * 64 + col * 8) = tile[wave][local][col];
+        }
+        wave_sync();
     }
 }
 
